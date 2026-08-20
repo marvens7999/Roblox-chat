@@ -19,6 +19,7 @@ const MAX_PLAYER_ID_LENGTH = 100;
 const MAX_DISPLAY_NAME_LENGTH = 100;
 const MAX_CHAT_LENGTH = 300;
 const MAX_COMMAND_LENGTH = 300;
+const MAX_STAFF_TAG_LENGTH = 40;
 
 //========================================================
 // WEBSOCKET SERVER
@@ -37,7 +38,14 @@ const wss = new WebSocketServer({
     rooms:
     roomId -> {
         clients: Set<WebSocket>,
-        createdAt: number
+        createdAt: number,
+
+        // ZERO CHAT staff tags
+        // playerId -> {
+        //     displayName: string,
+        //     tag: string
+        // }
+        staffTags: Map<string, object>
     }
 */
 
@@ -46,7 +54,8 @@ const rooms = new Map();
 function createRoom(roomId) {
     const room = {
         clients: new Set(),
-        createdAt: Date.now()
+        createdAt: Date.now(),
+        staffTags: new Map()
     };
 
     rooms.set(roomId, room);
@@ -101,6 +110,81 @@ function broadcastPresence(roomId) {
         type: "presence",
         online: room.clients.size
     });
+}
+
+//========================================================
+// STAFF TAG HELPERS
+//========================================================
+
+function getStaffTag(room, playerId) {
+    if (!room || !playerId) {
+        return null;
+    }
+
+    const entry = room.staffTags.get(String(playerId));
+
+    if (!entry) {
+        return null;
+    }
+
+    return entry.tag;
+}
+
+function getStaffTagList(room) {
+    if (!room) {
+        return [];
+    }
+
+    return Array.from(room.staffTags.entries()).map(
+        ([playerId, entry]) => ({
+            playerId: playerId,
+            displayName: entry.displayName,
+            tag: entry.tag
+        })
+    );
+}
+
+function findPlayerInRoom(room, name) {
+    if (!room) {
+        return null;
+    }
+
+    const search = String(name || "").trim().toLowerCase();
+
+    if (!search) {
+        return null;
+    }
+
+    // Exact username/display-name match first.
+    for (const client of room.clients) {
+        if (
+            String(client.displayName || "").toLowerCase() === search
+        ) {
+            return client;
+        }
+    }
+
+    // Exact player ID match.
+    for (const client of room.clients) {
+        if (
+            String(client.playerId || "").toLowerCase() === search
+        ) {
+            return client;
+        }
+    }
+
+    // Prefix match.
+    for (const client of room.clients) {
+        if (
+            String(client.displayName || "")
+                .toLowerCase()
+                .startsWith(search)
+        ) {
+            return client;
+        }
+    }
+
+    return null;
 }
 
 //========================================================
@@ -226,7 +310,11 @@ wss.on("connection", (ws) => {
             send(ws, {
                 type: "joined",
                 roomId: roomId,
-                online: room.clients.size
+                online: room.clients.size,
+
+                // Send current ZERO CHAT staff tags
+                // to the newly connected client.
+                staffTags: getStaffTagList(room)
             });
 
             broadcastPresence(roomId);
@@ -263,10 +351,24 @@ wss.on("connection", (ws) => {
                 return;
             }
 
+            // Get the current ZERO CHAT staff tag.
+            const staffTag = getStaffTag(
+                room,
+                ws.playerId
+            );
+
             broadcast(ws.roomId, {
                 type: "chat",
                 playerId: ws.playerId,
                 displayName: ws.displayName,
+
+                // Example:
+                // ROF: Chris: hello
+                //
+                // The client can use this field
+                // before the player's name.
+                staffTag: staffTag || "",
+
                 text: safeText,
                 timestamp: Date.now()
             });
@@ -321,7 +423,128 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            // Relay the command to every ZERO CHAT client.
+            //================================================
+            // ;staff User ROF
+            //================================================
+
+            const commandParts = safeCommand
+                .split(/\s+/);
+
+            const commandName = (
+                commandParts[0] || ""
+            ).toLowerCase();
+
+            if (commandName === ";staff") {
+
+                const targetName = commandParts[1];
+                const tag = commandParts
+                    .slice(2)
+                    .join(" ")
+                    .trim();
+
+                if (!targetName || !tag) {
+                    send(ws, {
+                        type: "error",
+                        message: "Usage: ;staff User ROF"
+                    });
+
+                    return;
+                }
+
+                const target = findPlayerInRoom(
+                    room,
+                    targetName
+                );
+
+                if (!target) {
+                    send(ws, {
+                        type: "error",
+                        message: "Player not found."
+                    });
+
+                    return;
+                }
+
+                const safeTag = tag.slice(
+                    0,
+                    MAX_STAFF_TAG_LENGTH
+                );
+
+                room.staffTags.set(
+                    String(target.playerId),
+                    {
+                        displayName: target.displayName,
+                        tag: safeTag
+                    }
+                );
+
+                // Tell every ZERO CHAT client
+                // about the new staff prefix.
+                broadcast(ws.roomId, {
+                    type: "staff_update",
+                    action: "set",
+                    playerId: target.playerId,
+                    displayName: target.displayName,
+                    tag: safeTag,
+                    timestamp: Date.now()
+                });
+
+                return;
+            }
+
+            //================================================
+            // ;unstaff User
+            //================================================
+
+            if (commandName === ";unstaff") {
+
+                const targetName = commandParts[1];
+
+                if (!targetName) {
+                    send(ws, {
+                        type: "error",
+                        message: "Usage: ;unstaff User"
+                    });
+
+                    return;
+                }
+
+                const target = findPlayerInRoom(
+                    room,
+                    targetName
+                );
+
+                if (!target) {
+                    send(ws, {
+                        type: "error",
+                        message: "Player not found."
+                    });
+
+                    return;
+                }
+
+                room.staffTags.delete(
+                    String(target.playerId)
+                );
+
+                // Tell every ZERO CHAT client
+                // to remove the prefix.
+                broadcast(ws.roomId, {
+                    type: "staff_update",
+                    action: "remove",
+                    playerId: target.playerId,
+                    displayName: target.displayName,
+                    timestamp: Date.now()
+                });
+
+                return;
+            }
+
+            //================================================
+            // OTHER ADMIN COMMANDS
+            //================================================
+
+            // Existing behavior remains unchanged.
             broadcast(ws.roomId, {
                 type: "admin_sync",
                 commandString: safeCommand,
