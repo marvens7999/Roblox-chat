@@ -34,21 +34,6 @@ const wss = new WebSocketServer({
 // ROOMS
 //========================================================
 
-/*
-    rooms:
-    roomId -> {
-        clients: Set<WebSocket>,
-        createdAt: number,
-
-        // ZERO CHAT staff tags
-        // playerId -> {
-        //     displayName: string,
-        //     tag: string
-        // }
-        staffTags: Map<string, object>
-    }
-*/
-
 const rooms = new Map();
 
 function createRoom(roomId) {
@@ -73,12 +58,15 @@ function getRoom(roomId) {
 
 function send(ws, payload) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-        return;
+        return false;
     }
 
     try {
         ws.send(JSON.stringify(payload));
-    } catch {}
+        return true;
+    } catch {
+        return false;
+    }
 }
 
 function broadcast(roomId, payload) {
@@ -91,11 +79,13 @@ function broadcast(roomId, payload) {
     const encoded = JSON.stringify(payload);
 
     for (const client of room.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            try {
-                client.send(encoded);
-            } catch {}
+        if (client.readyState !== WebSocket.OPEN) {
+            continue;
         }
+
+        try {
+            client.send(encoded);
+        } catch {}
     }
 }
 
@@ -113,21 +103,23 @@ function broadcastPresence(roomId) {
 }
 
 //========================================================
-// STAFF TAG HELPERS
+// STAFF TAGS
 //========================================================
 
 function getStaffTag(room, playerId) {
     if (!room || !playerId) {
-        return null;
+        return "";
     }
 
-    const entry = room.staffTags.get(String(playerId));
+    const entry = room.staffTags.get(
+        String(playerId)
+    );
 
     if (!entry) {
-        return null;
+        return "";
     }
 
-    return entry.tag;
+    return String(entry.tag || "");
 }
 
 function getStaffTagList(room) {
@@ -135,45 +127,73 @@ function getStaffTagList(room) {
         return [];
     }
 
-    return Array.from(room.staffTags.entries()).map(
-        ([playerId, entry]) => ({
-            playerId: playerId,
-            displayName: entry.displayName,
-            tag: entry.tag
-        })
-    );
+    const result = [];
+
+    for (const [playerId, entry] of room.staffTags) {
+        result.push({
+            playerId: String(playerId),
+            displayName: String(
+                entry.displayName || "Player"
+            ),
+            tag: String(entry.tag || "")
+        });
+    }
+
+    return result;
 }
+
+//========================================================
+// PLAYER LOOKUP
+//========================================================
 
 function findPlayerInRoom(room, name) {
     if (!room) {
         return null;
     }
 
-    const search = String(name || "").trim().toLowerCase();
+    const search = String(
+        name || ""
+    ).trim().toLowerCase();
 
     if (!search) {
         return null;
     }
 
-    // Exact username/display-name match first.
+    // Exact username / display name
     for (const client of room.clients) {
         if (
-            String(client.displayName || "").toLowerCase() === search
+            String(client.username || "")
+                .toLowerCase() === search
+            ||
+            String(client.displayName || "")
+                .toLowerCase() === search
         ) {
             return client;
         }
     }
 
-    // Exact player ID match.
+    // Exact UserId
     for (const client of room.clients) {
         if (
-            String(client.playerId || "").toLowerCase() === search
+            String(client.playerId || "")
+                .toLowerCase() === search
         ) {
             return client;
         }
     }
 
-    // Prefix match.
+    // Username prefix
+    for (const client of room.clients) {
+        if (
+            String(client.username || "")
+                .toLowerCase()
+                .startsWith(search)
+        ) {
+            return client;
+        }
+    }
+
+    // DisplayName prefix
     for (const client of room.clients) {
         if (
             String(client.displayName || "")
@@ -192,11 +212,12 @@ function findPlayerInRoom(room, name) {
 //========================================================
 
 function removeClientFromRoom(ws) {
-    if (!ws.roomId) {
+    const roomId = ws.roomId;
+
+    if (!roomId) {
         return;
     }
 
-    const roomId = ws.roomId;
     const room = rooms.get(roomId);
 
     ws.roomId = null;
@@ -206,6 +227,13 @@ function removeClientFromRoom(ws) {
     }
 
     room.clients.delete(ws);
+
+    // Remove stale staff assignment when player leaves.
+    if (ws.playerId) {
+        room.staffTags.delete(
+            String(ws.playerId)
+        );
+    }
 
     if (room.clients.size === 0) {
         rooms.delete(roomId);
@@ -238,6 +266,7 @@ wss.on("connection", (ws) => {
 
     ws.roomId = null;
     ws.playerId = null;
+    ws.username = null;
     ws.displayName = null;
 
     ws.isAlive = true;
@@ -259,17 +288,22 @@ wss.on("connection", (ws) => {
         let data;
 
         try {
-            data = JSON.parse(raw.toString());
+            data = JSON.parse(
+                raw.toString()
+            );
         } catch {
             return;
         }
 
-        if (!data || typeof data !== "object") {
+        if (
+            !data ||
+            typeof data !== "object"
+        ) {
             return;
         }
 
         //================================================
-        // JOIN ROOM
+        // JOIN
         //================================================
 
         if (data.type === "join") {
@@ -290,18 +324,42 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            // Remove previous room membership.
             removeClientFromRoom(ws);
 
             ws.roomId = roomId;
 
             ws.playerId = String(
                 data.playerId || ""
-            ).slice(0, MAX_PLAYER_ID_LENGTH);
+            ).slice(
+                0,
+                MAX_PLAYER_ID_LENGTH
+            );
+
+            /*
+                Supports both:
+                username
+                displayName
+            */
+
+            ws.username = String(
+                data.username ||
+                data.name ||
+                data.displayName ||
+                "Player"
+            ).slice(
+                0,
+                MAX_DISPLAY_NAME_LENGTH
+            );
 
             ws.displayName = String(
-                data.displayName || "Player"
-            ).slice(0, MAX_DISPLAY_NAME_LENGTH);
+                data.displayName ||
+                data.username ||
+                data.name ||
+                "Player"
+            ).slice(
+                0,
+                MAX_DISPLAY_NAME_LENGTH
+            );
 
             const room = getRoom(roomId);
 
@@ -309,11 +367,8 @@ wss.on("connection", (ws) => {
 
             send(ws, {
                 type: "joined",
-                roomId: roomId,
+                roomId,
                 online: room.clients.size,
-
-                // Send current ZERO CHAT staff tags
-                // to the newly connected client.
                 staffTags: getStaffTagList(room)
             });
 
@@ -323,14 +378,24 @@ wss.on("connection", (ws) => {
         }
 
         //================================================
+        // REQUIRE ROOM
+        //================================================
+
+        if (!ws.roomId) {
+            return;
+        }
+
+        const room = rooms.get(ws.roomId);
+
+        if (!room) {
+            return;
+        }
+
+        //================================================
         // CHAT
         //================================================
 
         if (data.type === "chat") {
-
-            if (!ws.roomId) {
-                return;
-            }
 
             const text = String(
                 data.text || ""
@@ -340,36 +405,34 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            const safeText = text.slice(
-                0,
-                MAX_CHAT_LENGTH
-            );
+            const safeText =
+                text.slice(
+                    0,
+                    MAX_CHAT_LENGTH
+                );
 
-            const room = rooms.get(ws.roomId);
-
-            if (!room) {
-                return;
-            }
-
-            // Get the current ZERO CHAT staff tag.
-            const staffTag = getStaffTag(
-                room,
-                ws.playerId
-            );
+            const staffTag =
+                getStaffTag(
+                    room,
+                    ws.playerId
+                );
 
             broadcast(ws.roomId, {
                 type: "chat",
-                playerId: ws.playerId,
-                displayName: ws.displayName,
 
-                // Example:
-                // ROF: Chris: hello
-                //
-                // The client can use this field
-                // before the player's name.
-                staffTag: staffTag || "",
+                playerId:
+                    String(ws.playerId || ""),
+
+                displayName:
+                    String(
+                        ws.displayName ||
+                        "Player"
+                    ),
+
+                staffTag,
 
                 text: safeText,
+
                 timestamp: Date.now()
             });
 
@@ -382,11 +445,7 @@ wss.on("connection", (ws) => {
 
         if (data.type === "admin_command") {
 
-            if (!ws.roomId) {
-                return;
-            }
-
-            // Server-side admin verification.
+            // Server-side admin check.
             if (
                 String(ws.playerId) !==
                 ADMIN_USER_ID
@@ -399,7 +458,7 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            const commandString = String(
+            let commandString = String(
                 data.commandString || ""
             ).trim();
 
@@ -407,85 +466,95 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            // Only accept commands.
-            if (commandString.charAt(0) !== ";") {
+            if (
+                commandString.charAt(0) !== ";"
+            ) {
                 return;
             }
 
-            const safeCommand = commandString.slice(
-                0,
-                MAX_COMMAND_LENGTH
-            );
+            commandString =
+                commandString.slice(
+                    0,
+                    MAX_COMMAND_LENGTH
+                );
 
-            const room = rooms.get(ws.roomId);
+            const parts =
+                commandString.split(/\s+/);
 
-            if (!room) {
-                return;
-            }
+            const commandName =
+                String(
+                    parts[0] || ""
+                ).toLowerCase();
 
             //================================================
-            // ;staff User ROF
+            // ;STAFF
             //================================================
-
-            const commandParts = safeCommand
-                .split(/\s+/);
-
-            const commandName = (
-                commandParts[0] || ""
-            ).toLowerCase();
 
             if (commandName === ";staff") {
 
-                const targetName = commandParts[1];
-                const tag = commandParts
+                const targetName = parts[1];
+
+                const tag = parts
                     .slice(2)
                     .join(" ")
                     .trim();
 
                 if (!targetName || !tag) {
+
                     send(ws, {
                         type: "error",
-                        message: "Usage: ;staff User ROF"
+                        message:
+                            "Usage: ;staff Player Tag"
                     });
 
                     return;
                 }
 
-                const target = findPlayerInRoom(
-                    room,
-                    targetName
-                );
+                const target =
+                    findPlayerInRoom(
+                        room,
+                        targetName
+                    );
 
                 if (!target) {
+
                     send(ws, {
                         type: "error",
-                        message: "Player not found."
+                        message:
+                            "Player not found."
                     });
 
                     return;
                 }
 
-                const safeTag = tag.slice(
-                    0,
-                    MAX_STAFF_TAG_LENGTH
-                );
+                const safeTag =
+                    tag.slice(
+                        0,
+                        MAX_STAFF_TAG_LENGTH
+                    );
 
                 room.staffTags.set(
                     String(target.playerId),
                     {
-                        displayName: target.displayName,
+                        displayName:
+                            target.displayName,
+
                         tag: safeTag
                     }
                 );
 
-                // Tell every ZERO CHAT client
-                // about the new staff prefix.
                 broadcast(ws.roomId, {
                     type: "staff_update",
                     action: "set",
-                    playerId: target.playerId,
-                    displayName: target.displayName,
+
+                    playerId:
+                        String(target.playerId),
+
+                    displayName:
+                        target.displayName,
+
                     tag: safeTag,
+
                     timestamp: Date.now()
                 });
 
@@ -493,31 +562,36 @@ wss.on("connection", (ws) => {
             }
 
             //================================================
-            // ;unstaff User
+            // ;UNSTAFF
             //================================================
 
             if (commandName === ";unstaff") {
 
-                const targetName = commandParts[1];
+                const targetName = parts[1];
 
                 if (!targetName) {
+
                     send(ws, {
                         type: "error",
-                        message: "Usage: ;unstaff User"
+                        message:
+                            "Usage: ;unstaff Player"
                     });
 
                     return;
                 }
 
-                const target = findPlayerInRoom(
-                    room,
-                    targetName
-                );
+                const target =
+                    findPlayerInRoom(
+                        room,
+                        targetName
+                    );
 
                 if (!target) {
+
                     send(ws, {
                         type: "error",
-                        message: "Player not found."
+                        message:
+                            "Player not found."
                     });
 
                     return;
@@ -527,13 +601,16 @@ wss.on("connection", (ws) => {
                     String(target.playerId)
                 );
 
-                // Tell every ZERO CHAT client
-                // to remove the prefix.
                 broadcast(ws.roomId, {
                     type: "staff_update",
                     action: "remove",
-                    playerId: target.playerId,
-                    displayName: target.displayName,
+
+                    playerId:
+                        String(target.playerId),
+
+                    displayName:
+                        target.displayName,
+
                     timestamp: Date.now()
                 });
 
@@ -541,14 +618,32 @@ wss.on("connection", (ws) => {
             }
 
             //================================================
-            // OTHER ADMIN COMMANDS
+            // ADMIN SYNC
             //================================================
 
-            // Existing behavior remains unchanged.
+            /*
+                Commands such as:
+
+                ;hl
+                ;unhl
+                ;title
+                ;untitle
+                ;ban
+
+                are sent to every connected client.
+
+                Each client then applies the visual/
+                local action to the matching player.
+            */
+
             broadcast(ws.roomId, {
                 type: "admin_sync",
-                commandString: safeCommand,
-                adminUserId: ADMIN_USER_ID,
+
+                commandString,
+
+                adminUserId:
+                    ADMIN_USER_ID,
+
                 timestamp: Date.now()
             });
 
@@ -588,7 +683,7 @@ wss.on("connection", (ws) => {
 });
 
 //========================================================
-// SERVER HEARTBEAT
+// HEARTBEAT
 //========================================================
 
 const heartbeatInterval = setInterval(() => {
@@ -612,14 +707,17 @@ const heartbeatInterval = setInterval(() => {
 }, 30000);
 
 //========================================================
-// CLEAN SHUTDOWN
+// SHUTDOWN
 //========================================================
 
 function shutdown() {
 
-    clearInterval(heartbeatInterval);
+    clearInterval(
+        heartbeatInterval
+    );
 
     for (const ws of wss.clients) {
+
         try {
             ws.close();
         } catch {}
@@ -630,8 +728,15 @@ function shutdown() {
     });
 }
 
-process.on("SIGTERM", shutdown);
-process.on("SIGINT", shutdown);
+process.on(
+    "SIGTERM",
+    shutdown
+);
+
+process.on(
+    "SIGINT",
+    shutdown
+);
 
 //========================================================
 // START
@@ -641,6 +746,7 @@ server.listen(
     PORT,
     "0.0.0.0",
     () => {
+
         console.log(
             `ZERO CHAT relay listening on port ${PORT}`
         );
